@@ -48,16 +48,8 @@ struct ServersView: View {
                         }
                         .buttonStyle(.plain)
                         .contextMenu {
-                            Button {
-                                editing = s
-                            } label: {
-                                Label("编辑", systemImage: "pencil")
-                            }
-                            Button(role: .destructive) {
-                                store.delete(s)
-                            } label: {
-                                Label("删除", systemImage: "trash")
-                            }
+                            Button { editing = s } label: { Label("编辑", systemImage: "pencil") }
+                            Button(role: .destructive) { store.delete(s) } label: { Label("删除", systemImage: "trash") }
                         }
                     }
                 }
@@ -67,18 +59,14 @@ struct ServersView: View {
             .navigationTitle("服务器")
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button {
-                        editing = ServerProfile(name: "", host: "")
-                    } label: {
+                    Button { editing = ServerProfile(name: "", host: "") } label: {
                         Image(systemName: "plus")
                     }
                 }
             }
             .sheet(item: $editing) { p in
-                NavigationView {
-                    ServerEditorView(profile: p)
-                }
-                .preferredColorScheme(.dark)
+                NavigationView { ServerEditorView(profile: p) }
+                    .preferredColorScheme(.dark)
             }
         }
         .navigationViewStyle(.stack)
@@ -136,15 +124,13 @@ struct ServerEditorView: View {
         _password = State(initialValue: profile.auth == .password ? secret : "")
         _keySecret = State(initialValue: profile.auth == .key ? secret : "")
         if profile.auth == .key, !secret.isEmpty {
-            let hint: String
             if secret.contains("BEGIN RSA PRIVATE KEY") {
-                hint = "已导入 RSA PEM 私钥"
+                _keySourceHint = State(initialValue: "已导入 RSA PEM 私钥")
             } else if secret.contains("BEGIN") {
-                hint = "已导入私钥文件"
+                _keySourceHint = State(initialValue: "已导入私钥文件")
             } else {
-                hint = "本机生成的密钥"
+                _keySourceHint = State(initialValue: "本机生成的密钥")
             }
-            _keySourceHint = State(initialValue: hint)
         }
     }
 
@@ -152,24 +138,24 @@ struct ServerEditorView: View {
         !store.servers.contains(where: { $0.id == p.id })
     }
 
-    /// 展示用公钥：解析失败时返回 nil，绝不抛错/崩
+    /// 绝不在界面刷新时解析 RSA PEM（会闪退）
     private var publicKeyText: String? {
         let s = keySecret.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !s.isEmpty else { return nil }
+        if KeyMaterial.isRawPEM(s) { return nil }
         return KeyMaterial.publicKey(from: s)
+    }
+
+    private var hasKeyMaterial: Bool {
+        let s = keySecret.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !s.isEmpty && (s.contains("BEGIN") || publicKeyText != nil)
     }
 
     private var valid: Bool {
         let hostOK = !p.host.trimmingCharacters(in: .whitespaces).isEmpty
         let userOK = !p.username.trimmingCharacters(in: .whitespaces).isEmpty
-        let authOK: Bool
-        if p.auth == .password {
-            authOK = true
-        } else {
-            let s = keySecret.trimmingCharacters(in: .whitespacesAndNewlines)
-            authOK = !s.isEmpty && (s.contains("BEGIN") || publicKeyText != nil)
-        }
-        return hostOK && userOK && authOK
+        if p.auth == .password { return hostOK && userOK }
+        return hostOK && userOK && hasKeyMaterial
     }
 
     var body: some View {
@@ -220,10 +206,7 @@ struct ServerEditorView: View {
             allowedContentTypes: [.data, .plainText, .text, UTType(filenameExtension: "pem") ?? .data],
             allowsMultipleSelection: false
         ) { result in
-            // 回调可能不在主线程
-            DispatchQueue.main.async {
-                handleImport(result)
-            }
+            DispatchQueue.main.async { handleImport(result) }
         }
     }
 
@@ -245,11 +228,12 @@ struct ServerEditorView: View {
             } label: {
                 Label(copied ? "已复制" : "复制公钥", systemImage: "doc.on.doc")
             }
-            Text("AWS / Lightsail 实例创建时通常已写入对应公钥，可直接用此私钥登录。")
+        } else if KeyMaterial.isRawPEM(keySecret) {
+            Text("已读入 RSA 私钥文件。Lightsail 用户名一般为 ubuntu 或 bitnami。点「保存」时会校验。")
                 .font(.caption)
                 .foregroundColor(.secondary)
-        } else if keySecret.trimmingCharacters(in: .whitespacesAndNewlines).contains("BEGIN") {
-            Text("已读入私钥文件，点「保存」时会校验格式。")
+        } else if keySecret.contains("BEGIN") {
+            Text("已读入私钥，点「保存」时会校验格式。")
                 .font(.caption)
                 .foregroundColor(.secondary)
         } else {
@@ -264,9 +248,7 @@ struct ServerEditorView: View {
             .textInputAutocapitalization(.never)
             .disableAutocorrection(true)
 
-        Button {
-            showImporter = true
-        } label: {
+        Button { showImporter = true } label: {
             Label("从文件导入私钥（.pem / OpenSSH）", systemImage: "doc.badge.plus")
         }
 
@@ -288,19 +270,6 @@ struct ServerEditorView: View {
             importError = nil
             copied = false
         }
-
-        if let pub = publicKeyText, pub.hasPrefix("ssh-ed25519"),
-           let parsed = try? KeyMaterial.parse(keySecret),
-           case .ed25519(let key) = parsed {
-            Button {
-                UIPasteboard.general.string = key.makeSSHRepresentation(comment: "sshdash")
-            } label: {
-                Label("复制完整私钥（OpenSSH 格式）", systemImage: "key")
-            }
-            Text("仅在可信环境使用。私钥离开本机钥匙串后请自行妥善保管。")
-                .font(.caption2)
-                .foregroundColor(.orange)
-        }
     }
 
     private func handleImport(_ result: Result<[URL], Error>) {
@@ -313,25 +282,22 @@ struct ServerEditorView: View {
             defer { if accessed { url.stopAccessingSecurityScopedResource() } }
             do {
                 let data = try Data(contentsOf: url)
-                // 兼容 UTF-8 / ASCII；去掉可能的 BOM
                 var text = String(data: data, encoding: .utf8)
                     ?? String(data: data, encoding: .ascii)
                     ?? String(data: data, encoding: .isoLatin1)
-                if text == nil {
+                guard var t = text else {
                     importError = "无法读取文件内容（编码不支持）"
                     return
                 }
-                if text!.hasPrefix("\u{FEFF}") {
-                    text = String(text!.dropFirst())
-                }
-                applyImportedKey(text!, source: "已从文件导入：\(url.lastPathComponent)")
+                if t.hasPrefix("\u{FEFF}") { t = String(t.dropFirst()) }
+                applyImportedKey(t, source: "已从文件导入：\(url.lastPathComponent)")
             } catch {
                 importError = "读取文件失败：\(error.localizedDescription)"
             }
         }
     }
 
-    /// 选文件时只保存原文，不立刻做重解析，避免闪退
+    /// 只存原文，绝不在这里解析（解析会闪退）
     private func applyImportedKey(_ text: String, source: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.contains("BEGIN"), trimmed.contains("PRIVATE KEY") else {
@@ -340,7 +306,7 @@ struct ServerEditorView: View {
         }
         keySecret = trimmed
         if trimmed.contains("BEGIN RSA PRIVATE KEY") {
-            keySourceHint = source + "（RSA PEM）"
+            keySourceHint = source + "（RSA PEM，保存时校验）"
         } else if trimmed.contains("OPENSSH") {
             keySourceHint = source + "（OpenSSH）"
         } else {
@@ -435,11 +401,7 @@ struct ServerDetailView: View {
                         }
                         .disabled(installing || monitor.state != .connected)
                     } label: {
-                        if installing {
-                            ProgressView()
-                        } else {
-                            Image(systemName: "key")
-                        }
+                        if installing { ProgressView() } else { Image(systemName: "key") }
                     }
                     NavigationLink(
                         destination: AIChatView(
@@ -479,6 +441,17 @@ struct ServerDetailView: View {
             return
         }
 
+        // RSA PEM 已存钥匙串：尝试解析出公钥再写入
+        if let pub = (try? KeyMaterial.normalize(secret: secret, passphrase: nil))?.publicKey {
+            do {
+                let out = try await monitor.runStreamCollect(RemoteShell.wrap(PubkeyInstall.script(publicKey: pub)))
+                installMsg = out
+            } catch {
+                installMsg = friendlyError(error)
+            }
+            return
+        }
+
         let key = Curve25519.Signing.PrivateKey()
         let openssh = key.makeSSHRepresentation(comment: "sshdash")
         let pub = sshPublicKeyString(key, comment: "sshdash")
@@ -490,7 +463,7 @@ struct ServerDetailView: View {
             if let i = store.servers.firstIndex(where: { $0.id == updated.id }) {
                 store.servers[i] = updated
             }
-            installMsg = out + "\n\n已生成本机密钥并写入服务器，登录方式已切换为「密钥」。\n下次可用密钥登录（无需再输密码）。\n公钥：\n" + pub
+            installMsg = out + "\n\n已生成本机密钥并写入服务器，登录方式已切换为「密钥」。\n公钥：\n" + pub
         } catch {
             installMsg = friendlyError(error)
         }

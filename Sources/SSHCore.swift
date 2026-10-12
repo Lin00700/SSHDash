@@ -35,6 +35,14 @@ enum ParsedKey {
 }
 
 enum KeyMaterial {
+    /// 是否为「原始 PEM 文本」，界面上不应自动解析
+    static func isRawPEM(_ secret: String) -> Bool {
+        let s = secret.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.contains("BEGIN RSA PRIVATE KEY") { return true }
+        if s.contains("BEGIN PRIVATE KEY"), !s.contains("OPENSSH") { return true }
+        return false
+    }
+
     static func normalize(secret: String, passphrase: String?) throws -> (stored: String, publicKey: String) {
         let trimmed = secret.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw AppSSHError.badKey }
@@ -65,10 +73,7 @@ enum KeyMaterial {
             if trimmed.contains("ENCRYPTED") {
                 throw AppSSHError.encryptedPEM
             }
-            if let rsa = try? parseRSAPkcs8PEM(trimmed) {
-                return rsa
-            }
-            throw AppSSHError.badKey
+            return try parseRSAPkcs8PEM(trimmed)
         }
 
         // 3) OpenSSH 格式
@@ -78,14 +83,15 @@ enum KeyMaterial {
                 let key = try Curve25519.Signing.PrivateKey(sshEd25519: trimmed, decryptionKey: passData)
                 return .ed25519(key)
             } catch {
-                // 继续尝试 RSA
+                // fall through to RSA
             }
             do {
                 let rsa = try Insecure.RSA.PrivateKey(sshRsa: trimmed)
-                return .rsa(rsa, publicKeyLine: "ssh-rsa (openssh-imported) sshdash")
+                return .rsa(rsa, publicKeyLine: "ssh-rsa (openssh) sshdash")
             } catch {
                 let desc = String(describing: error).lowercased()
-                if passData == nil, desc.contains("decrypt") || desc.contains("pass") || desc.contains("cipher") || desc.contains("kdf") {
+                if passData == nil,
+                   desc.contains("decrypt") || desc.contains("pass") || desc.contains("cipher") || desc.contains("kdf") {
                     throw AppSSHError.needPassphrase
                 }
                 throw AppSSHError.badKey
@@ -102,7 +108,9 @@ enum KeyMaterial {
         throw AppSSHError.badKey
     }
 
+    /// 仅用于展示；原始 RSA PEM 返回 nil，避免在 UI 线程做重解析
     static func publicKey(from secret: String) -> String? {
+        if isRawPEM(secret) { return nil }
         guard let parsed = try? parse(secret) else { return nil }
         switch parsed {
         case .ed25519(let k):
@@ -131,7 +139,7 @@ private extension Data {
     }
 }
 
-// MARK: - RSA PKCS#1 / PKCS#8 PEM（全程边界检查，禁止强制解包）
+// MARK: - RSA PKCS#1 / PKCS#8 PEM
 
 private func pemBody(_ pem: String, begin: String, end: String) throws -> Data {
     let lines = pem
@@ -147,7 +155,6 @@ private func pemBody(_ pem: String, begin: String, end: String) throws -> Data {
         throw AppSSHError.badKey
     }
 
-    // 去掉中间可能的 Proc-Type / DEK-Info 头
     var payload: [String] = []
     for line in lines[(b + 1)..<e] {
         if line.hasPrefix("Proc-Type") || line.hasPrefix("DEK-Info") { continue }
@@ -155,7 +162,7 @@ private func pemBody(_ pem: String, begin: String, end: String) throws -> Data {
     }
     let b64 = payload.joined()
         .replacingOccurrences(of: "\\s", with: "", options: .regularExpression)
-    guard !b64.isEmpty, let data = Data(base64Encoded: b64), !data.isEmpty else {
+    guard !b64.isEmpty, let data = Data(base64Encoded: b64), data.count > 16 else {
         throw AppSSHError.badKey
     }
     return data
@@ -194,7 +201,7 @@ private func parseRSAPkcs8PEM(_ pem: String) throws -> ParsedKey {
 }
 
 private func rsaFromPKCS1DER(_ der: Data) throws -> ParsedKey {
-    guard !der.isEmpty else { throw AppSSHError.badKey }
+    guard der.count > 20 else { throw AppSSHError.badKey }
     var idx = 0
     guard der.byte(at: idx) == 0x30 else { throw AppSSHError.badKey }
     idx += 1
@@ -205,7 +212,7 @@ private func rsaFromPKCS1DER(_ der: Data) throws -> ParsedKey {
     let e = try readASN1Integer(der, &idx)
     let d = try readASN1Integer(der, &idx)
 
-    guard !n.isEmpty, !e.isEmpty, !d.isEmpty else { throw AppSSHError.badKey }
+    guard n.count >= 64, !e.isEmpty, d.count >= 64 else { throw AppSSHError.badKey }
 
     guard let nBN = bnFromData(n),
           let eBN = bnFromData(e),
@@ -218,9 +225,9 @@ private func rsaFromPKCS1DER(_ der: Data) throws -> ParsedKey {
     return .rsa(key, publicKeyLine: pub)
 }
 
-private func bnFromData(_ data: Data) -> OpaquePointer? {
+private func bnFromData(_ data: Data) -> UnsafeMutablePointer<BIGNUM>? {
     guard !data.isEmpty else { return nil }
-    return data.withUnsafeBytes { raw -> OpaquePointer? in
+    return data.withUnsafeBytes { raw -> UnsafeMutablePointer<BIGNUM>? in
         guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return nil }
         return CCryptoBoringSSL_BN_bin2bn(base, data.count, nil)
     }
@@ -239,8 +246,6 @@ private func readASN1Length(_ data: Data, _ idx: inout Int) throws -> Int {
         len = (len << 8) | Int(b)
         idx += 1
     }
-    guard len >= 0, idx + len <= data.count || true else { throw AppSSHError.badKey }
-    // 长度字段本身合法即可；内容边界由调用方再校验
     return len
 }
 
