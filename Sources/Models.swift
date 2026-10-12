@@ -6,7 +6,7 @@ enum AuthKind: String, Codable, CaseIterable, Identifiable {
     case key
 
     var id: String { rawValue }
-    var label: String { self == .password ? "密码" : "密钥（ed25519）" }
+    var label: String { self == .password ? "密码" : "密钥" }
 }
 
 struct ServerProfile: Codable, Identifiable, Hashable {
@@ -51,9 +51,9 @@ struct ServerStats {
 }
 
 struct DeployParam: Identifiable {
-    let id: String        // 作为 shell 变量名，例如 PORT
+    let id: String
     let label: String
-    let value: String     // 默认值
+    let value: String
 }
 
 struct DeployTemplate: Identifiable {
