@@ -76,14 +76,13 @@ enum KeyMaterial {
         let trimmed = secret.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw AppSSHError.badKey }
 
-        // RSA PEM → 转成 OpenSSH 再交给 Citadel 官方解析器
         if trimmed.contains("BEGIN RSA PRIVATE KEY") {
             if trimmed.contains("ENCRYPTED") || trimmed.contains("Proc-Type: 4,ENCRYPTED") {
                 throw AppSSHError.encryptedPEM
             }
-            let openssh = try RSAComponents.fromPKCS1PEM(trimmed).toOpenSSHPrivateKey(comment: "sshdash")
-            let rsa = try Insecure.RSA.PrivateKey(sshRsa: openssh)
             let comps = try RSAComponents.fromPKCS1PEM(trimmed)
+            let openssh = comps.toOpenSSHPrivateKey(comment: "sshdash")
+            let rsa = try Insecure.RSA.PrivateKey(sshRsa: openssh)
             let pub = sshRSAPublicKeyString(modulus: comps.n, exponent: comps.e, comment: "sshdash")
             return .rsa(rsa, publicKeyLine: pub)
         }
@@ -128,9 +127,8 @@ enum KeyMaterial {
     static func publicKey(from secret: String) -> String? {
         let s = secret.trimmingCharacters(in: .whitespacesAndNewlines)
         if isRawPEM(s) {
-            // 纯 Swift 抽 n/e，不碰 BoringSSL
-            if let comps = try? RSAComponents.fromPKCS1PEM(s)
-                ?? (try? RSAComponents.fromPKCS8PEM(s)) {
+            let comps = (try? RSAComponents.fromPKCS1PEM(s)) ?? (try? RSAComponents.fromPKCS8PEM(s))
+            if let comps = comps {
                 return sshRSAPublicKeyString(modulus: comps.n, exponent: comps.e, comment: "sshdash")
             }
             return nil
@@ -199,14 +197,14 @@ private struct RSAComponents {
         idx += 1
         _ = try readASN1Length(der, &idx)
 
-        _ = try readASN1Integer(der, &idx) // version
+        _ = try readASN1Integer(der, &idx)
         let n = try readASN1Integer(der, &idx)
         let e = try readASN1Integer(der, &idx)
         let d = try readASN1Integer(der, &idx)
         let p = try readASN1Integer(der, &idx)
         let q = try readASN1Integer(der, &idx)
-        _ = try readASN1Integer(der, &idx) // exp1
-        _ = try readASN1Integer(der, &idx) // exp2
+        _ = try readASN1Integer(der, &idx)
+        _ = try readASN1Integer(der, &idx)
         let iqmp = try readASN1Integer(der, &idx)
 
         guard n.count >= 64, !e.isEmpty, d.count >= 64, !p.isEmpty, !q.isEmpty, !iqmp.isEmpty else {
@@ -215,29 +213,22 @@ private struct RSAComponents {
         return RSAComponents(n: n, e: e, d: d, p: p, q: q, iqmp: iqmp)
     }
 
-    /// 转成 OpenSSH 私钥文本，供 Citadel `sshRsa:` 使用
     func toOpenSSHPrivateKey(comment: String) -> String {
         var root = Data()
-
-        // magic
         root.append(contentsOf: Array("openssh-key-v1".utf8))
         root.append(0x00)
 
-        putSSHString(&root, Data("none".utf8)) // cipher
-        putSSHString(&root, Data("none".utf8)) // kdf
-        putSSHString(&root, Data())             // kdf options
-
-        // # keys = 1
+        putSSHString(&root, Data("none".utf8))
+        putSSHString(&root, Data("none".utf8))
+        putSSHString(&root, Data())
         putU32(&root, 1)
 
-        // public key blob
         var pub = Data()
         putSSHString(&pub, Data("ssh-rsa".utf8))
         putMPInt(&pub, e)
         putMPInt(&pub, n)
         putSSHString(&root, pub)
 
-        // private key blob
         var priv = Data()
         let check = UInt32.random(in: 0...UInt32.max)
         putU32(&priv, check)
@@ -251,19 +242,12 @@ private struct RSAComponents {
         putMPInt(&priv, q)
         putSSHString(&priv, Data(comment.utf8))
 
-        // pad to multiple of 8
-        let pad = (8 - (priv.count % 8)) % 8
-        if pad == 0 {
-            // OpenSSH still pads a full block when already aligned? cipher none blockSize=8
-            // 若已对齐，补 8 字节 1..8
-            for i in 1...8 { priv.append(UInt8(i)) }
-        } else {
-            for i in 1...pad { priv.append(UInt8(i)) }
-        }
+        let mod = priv.count % 8
+        let pad = mod == 0 ? 8 : (8 - mod)
+        for i in 1...pad { priv.append(UInt8(i)) }
         putSSHString(&root, priv)
 
         let b64 = root.base64EncodedString()
-        // 每 70 字符换行，兼容部分解析器
         var wrapped = ""
         var i = b64.startIndex
         while i < b64.endIndex {
@@ -275,8 +259,6 @@ private struct RSAComponents {
         return "-----BEGIN OPENSSH PRIVATE KEY-----\n\(wrapped)-----END OPENSSH PRIVATE KEY-----\n"
     }
 }
-
-// MARK: - SSH / ASN.1 helpers（纯 Swift）
 
 private extension Data {
     func byte(at i: Int) -> UInt8? {
@@ -353,14 +335,11 @@ private func readASN1Integer(_ data: Data, _ idx: inout Int) throws -> Data {
     guard len > 0, idx + len <= data.count else { throw AppSSHError.badKey }
     var intData = data.subdata(in: idx..<(idx + len))
     idx += len
-    // 保留数值：去掉多余前导 0，但至少留 1 字节
     while intData.count > 1, intData.byte(at: 0) == 0x00 {
         intData = intData.dropFirst()
     }
     return Data(intData)
 }
-
-// MARK: - 公钥行
 
 func sshEd25519PublicKeyString(_ priv: Curve25519.Signing.PrivateKey, comment: String) -> String {
     let pub = priv.publicKey.rawRepresentation
@@ -381,8 +360,6 @@ func sshRSAPublicKeyString(modulus: Data, exponent: Data, comment: String) -> St
     putMPInt(&blob, modulus)
     return "ssh-rsa \(blob.base64EncodedString()) \(comment)"
 }
-
-// MARK: - SSH 连接
 
 final class SSHConn {
     private var client: SSHClient?
