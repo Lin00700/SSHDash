@@ -6,11 +6,15 @@ import NIOCore
 enum AppSSHError: LocalizedError {
     case notConnected
     case badKey
+    case needPassphrase
+    case unsupportedKey
 
     var errorDescription: String? {
         switch self {
         case .notConnected: return "尚未连接到服务器"
-        case .badKey: return "私钥无效，请在服务器设置里重新生成密钥"
+        case .badKey: return "私钥无效，请重新导入或生成密钥"
+        case .needPassphrase: return "私钥已加密，请填写密钥口令"
+        case .unsupportedKey: return "暂不支持该密钥类型，请使用 ed25519（推荐）"
         }
     }
 }
@@ -18,6 +22,61 @@ enum AppSSHError: LocalizedError {
 final class WeakBox<T: AnyObject> {
     weak var value: T?
     init(_ v: T) { value = v }
+}
+
+/// 解析并规范化私钥材料。
+/// 支持：
+/// 1) 本 App 生成的 base64(raw 32 bytes)
+/// 2) OpenSSH 格式 -----BEGIN OPENSSH PRIVATE KEY-----
+/// 3) 带口令的 OpenSSH ed25519
+enum KeyMaterial {
+    /// 返回可存入钥匙串的规范化私钥字符串，以及可展示的公钥
+    static func normalize(secret: String, passphrase: String?) throws -> (stored: String, publicKey: String) {
+        let trimmed = secret.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("-----") {
+            let passData = passphrase.flatMap { $0.isEmpty ? nil : $0.data(using: .utf8) }
+            do {
+                let key = try Curve25519.Signing.PrivateKey(sshEd25519: trimmed, decryptionKey: passData)
+                // 统一存成无口令的 OpenSSH 格式，后续连接不再需要口令
+                let openssh = key.makeSSHRepresentation(comment: "sshdash")
+                let pub = sshPublicKeyString(key, comment: "sshdash")
+                return (openssh, pub)
+            } catch {
+                // 常见：缺口令 / 口令错误 / 不是 ed25519
+                let desc = String(describing: error).lowercased()
+                if passData == nil, desc.contains("decrypt") || desc.contains("pass") || desc.contains("cipher") || desc.contains("kdf") {
+                    throw AppSSHError.needPassphrase
+                }
+                if trimmed.contains("ssh-rsa") || trimmed.lowercased().contains("rsa") {
+                    throw AppSSHError.unsupportedKey
+                }
+                throw AppSSHError.badKey
+            }
+        }
+        // 兼容旧版：base64 raw
+        guard let raw = Data(base64Encoded: trimmed),
+              let key = try? Curve25519.Signing.PrivateKey(rawRepresentation: raw) else {
+            throw AppSSHError.badKey
+        }
+        return (trimmed, sshPublicKeyString(key, comment: "sshdash"))
+    }
+
+    static func privateKey(from secret: String) throws -> Curve25519.Signing.PrivateKey {
+        let trimmed = secret.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("-----") {
+            return try Curve25519.Signing.PrivateKey(sshEd25519: trimmed)
+        }
+        guard let raw = Data(base64Encoded: trimmed),
+              let key = try? Curve25519.Signing.PrivateKey(rawRepresentation: raw) else {
+            throw AppSSHError.badKey
+        }
+        return key
+    }
+
+    static func publicKey(from secret: String) -> String? {
+        guard let key = try? privateKey(from: secret) else { return nil }
+        return sshPublicKeyString(key, comment: "sshdash")
+    }
 }
 
 /// 对 Citadel 的薄封装
@@ -30,10 +89,7 @@ final class SSHConn {
         case .password:
             method = .passwordBased(username: p.username, password: secret)
         case .key:
-            guard let raw = Data(base64Encoded: secret),
-                  let key = try? Curve25519.Signing.PrivateKey(rawRepresentation: raw) else {
-                throw AppSSHError.badKey
-            }
+            let key = try KeyMaterial.privateKey(from: secret)
             method = .ed25519(username: p.username, privateKey: key)
         }
         client = try await SSHClient.connect(
@@ -86,6 +142,7 @@ enum RemoteShell {
 }
 
 func friendlyError(_ e: Error) -> String {
+    if let a = e as? AppSSHError, let m = a.errorDescription { return m }
     let d = String(describing: e)
     if d.contains("allAuthenticationOptionsFailed") {
         return "认证失败：请检查用户名、密码或密钥（服务器可能禁用了密码登录）"
@@ -112,4 +169,26 @@ func sshPublicKeyString(_ priv: Curve25519.Signing.PrivateKey, comment: String) 
     put(Data("ssh-ed25519".utf8))
     put(pub)
     return "ssh-ed25519 \(blob.base64EncodedString()) \(comment)"
+}
+
+/// 把公钥追加到远端 authorized_keys（幂等：已存在则跳过）
+enum PubkeyInstall {
+    static func script(publicKey: String) -> String {
+        let b64 = Data(publicKey.utf8).base64EncodedString()
+        return """
+        set -e
+        PUB=$(echo '\(b64)' | base64 -d)
+        mkdir -p ~/.ssh
+        chmod 700 ~/.ssh
+        touch ~/.ssh/authorized_keys
+        chmod 600 ~/.ssh/authorized_keys
+        if grep -qxF "$PUB" ~/.ssh/authorized_keys 2>/dev/null; then
+          echo "公钥已存在，无需重复添加"
+        else
+          echo "$PUB" >> ~/.ssh/authorized_keys
+          echo "✅ 已写入 authorized_keys"
+        fi
+        echo "当前 authorized_keys 行数：$(wc -l < ~/.ssh/authorized_keys | tr -d ' ')"
+        """
+    }
 }

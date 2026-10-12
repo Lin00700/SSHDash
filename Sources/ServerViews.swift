@@ -1,5 +1,6 @@
 import SwiftUI
 import Crypto
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @StateObject private var store = ServerStore()
@@ -35,7 +36,7 @@ struct ServersView: View {
                             Label("还没有服务器", systemImage: "server.rack")
                                 .font(.headline)
                                 .foregroundStyle(Theme.gradient)
-                            Text("点右上角 + 添加。支持密码登录，或在 App 里生成 ed25519 密钥后把公钥加到服务器。")
+                            Text("点右上角 + 添加。支持密码、本机生成密钥，或直接导入已有的 OpenSSH 私钥文件（id_ed25519）。")
                                 .font(.footnote)
                                 .foregroundColor(Theme.textDim)
                         }
@@ -121,15 +122,22 @@ struct ServerEditorView: View {
     @State private var p: ServerProfile
     @State private var portText: String
     @State private var password: String
-    @State private var keyB64: String
+    @State private var keySecret: String
+    @State private var keyPassphrase: String = ""
     @State private var copied = false
+    @State private var importError: String?
+    @State private var showImporter = false
+    @State private var keySourceHint = ""
 
     init(profile: ServerProfile) {
         _p = State(initialValue: profile)
         _portText = State(initialValue: String(profile.port))
         let secret = ServerStore.secret(for: profile)
         _password = State(initialValue: profile.auth == .password ? secret : "")
-        _keyB64 = State(initialValue: profile.auth == .key ? secret : "")
+        _keySecret = State(initialValue: profile.auth == .key ? secret : "")
+        if profile.auth == .key, !secret.isEmpty {
+            _keySourceHint = State(initialValue: secret.hasPrefix("-----") ? "已导入 OpenSSH 私钥" : "本机生成的密钥")
+        }
     }
 
     private var isNew: Bool {
@@ -137,15 +145,18 @@ struct ServerEditorView: View {
     }
 
     private var publicKeyText: String? {
-        guard let raw = Data(base64Encoded: keyB64),
-              let k = try? Curve25519.Signing.PrivateKey(rawRepresentation: raw) else { return nil }
-        return sshPublicKeyString(k, comment: "sshdash")
+        KeyMaterial.publicKey(from: keySecret)
     }
 
     private var valid: Bool {
         let hostOK = !p.host.trimmingCharacters(in: .whitespaces).isEmpty
         let userOK = !p.username.trimmingCharacters(in: .whitespaces).isEmpty
-        let authOK = p.auth == .password || publicKeyText != nil
+        let authOK: Bool
+        if p.auth == .password {
+            authOK = true
+        } else {
+            authOK = publicKeyText != nil || keySecret.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("-----")
+        }
         return hostOK && userOK && authOK
     }
 
@@ -192,10 +203,23 @@ struct ServerEditorView: View {
                 Button("取消") { mode.wrappedValue.dismiss() }
             }
         }
+        .fileImporter(
+            isPresented: $showImporter,
+            allowedContentTypes: [.data, .plainText, .text, UTType(filenameExtension: "pem") ?? .data],
+            allowsMultipleSelection: false
+        ) { result in
+            handleImport(result)
+        }
     }
 
     @ViewBuilder
     private var keySection: some View {
+        if !keySourceHint.isEmpty {
+            Text(keySourceHint)
+                .font(.caption)
+                .foregroundColor(Theme.cyan)
+        }
+
         if let pub = publicKeyText {
             Text(pub)
                 .font(.system(.caption2, design: .monospaced))
@@ -206,14 +230,100 @@ struct ServerEditorView: View {
             } label: {
                 Label(copied ? "已复制" : "复制公钥", systemImage: "doc.on.doc")
             }
-            Text("把这一行公钥追加到服务器的 ~/.ssh/authorized_keys，再点保存。")
+            Text("把这一行公钥追加到服务器的 ~/.ssh/authorized_keys。若服务器还能用密码登录，保存后可在详情页一键写入。")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        } else if keySecret.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("-----") {
+            Text("已粘贴私钥内容，保存时会校验格式。若密钥有口令，请在下方填写。")
                 .font(.caption)
                 .foregroundColor(.secondary)
         } else {
             Text("还没有密钥").foregroundColor(.secondary)
         }
-        Button(publicKeyText == nil ? "生成密钥对" : "重新生成（旧公钥将失效）") {
-            keyB64 = Curve25519.Signing.PrivateKey().rawRepresentation.base64EncodedString()
+
+        if let e = importError {
+            Text(e).font(.caption).foregroundColor(.red)
+        }
+
+        SecureField("密钥口令（仅加密私钥需要）", text: $keyPassphrase)
+            .textInputAutocapitalization(.never)
+            .disableAutocorrection(true)
+
+        Button {
+            showImporter = true
+        } label: {
+            Label("从文件导入私钥", systemImage: "doc.badge.plus")
+        }
+
+        Button {
+            if let clip = UIPasteboard.general.string, clip.contains("BEGIN") {
+                applyImportedKey(clip, source: "从剪贴板导入")
+            } else {
+                importError = "剪贴板里没有 OpenSSH 私钥（需要包含 BEGIN OPENSSH PRIVATE KEY）"
+            }
+        } label: {
+            Label("从剪贴板粘贴私钥", systemImage: "doc.on.clipboard")
+        }
+
+        Button(publicKeyText == nil && keySecret.isEmpty ? "生成密钥对" : "重新生成（旧公钥将失效）") {
+            let key = Curve25519.Signing.PrivateKey()
+            // 存成 OpenSSH 标准格式，方便导出到其他工具
+            keySecret = key.makeSSHRepresentation(comment: "sshdash")
+            keyPassphrase = ""
+            keySourceHint = "本机新生成的 ed25519 密钥"
+            importError = nil
+            copied = false
+        }
+
+        if publicKeyText != nil, let openssh = try? KeyMaterial.privateKey(from: keySecret).makeSSHRepresentation(comment: "sshdash") {
+            Button {
+                UIPasteboard.general.string = openssh
+            } label: {
+                Label("复制完整私钥（OpenSSH 格式）", systemImage: "key")
+            }
+            Text("仅在可信环境使用。私钥离开本机钥匙串后请自行妥善保管。")
+                .font(.caption2)
+                .foregroundColor(.orange)
+        }
+    }
+
+    private func handleImport(_ result: Result<[URL], Error>) {
+        switch result {
+        case .failure(let e):
+            importError = e.localizedDescription
+        case .success(let urls):
+            guard let url = urls.first else { return }
+            let accessed = url.startAccessingSecurityScopedResource()
+            defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+            do {
+                let data = try Data(contentsOf: url)
+                guard let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .ascii) else {
+                    importError = "无法读取文件内容"
+                    return
+                }
+                applyImportedKey(text, source: "已从文件导入：\(url.lastPathComponent)")
+            } catch {
+                importError = "读取文件失败：\(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func applyImportedKey(_ text: String, source: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.contains("BEGIN") && trimmed.contains("PRIVATE KEY") else {
+            importError = "不是私钥文件（需要 OpenSSH 格式的 PRIVATE KEY）"
+            return
+        }
+        // 先尝试无口令解析；失败则先原样保存，保存时再带口令规范化
+        if let normalized = try? KeyMaterial.normalize(secret: trimmed, passphrase: keyPassphrase.isEmpty ? nil : keyPassphrase) {
+            keySecret = normalized.stored
+            keySourceHint = source + "（ed25519）"
+            importError = nil
+            copied = false
+        } else {
+            keySecret = trimmed
+            keySourceHint = source + "（待校验）"
+            importError = nil
             copied = false
         }
     }
@@ -225,7 +335,24 @@ struct ServerEditorView: View {
         np.port = Int(portText) ?? 22
         np.name = np.name.trimmingCharacters(in: .whitespaces)
         if np.name.isEmpty { np.name = np.host }
-        ServerStore.setSecret(np.auth == .password ? password : keyB64, for: np)
+
+        if np.auth == .password {
+            ServerStore.setSecret(password, for: np)
+        } else {
+            do {
+                let normalized = try KeyMaterial.normalize(
+                    secret: keySecret,
+                    passphrase: keyPassphrase.isEmpty ? nil : keyPassphrase
+                )
+                ServerStore.setSecret(normalized.stored, for: np)
+                keySecret = normalized.stored
+                importError = nil
+            } catch {
+                importError = friendlyError(error)
+                return
+            }
+        }
+
         if let i = store.servers.firstIndex(where: { $0.id == np.id }) {
             store.servers[i] = np
         } else {
@@ -241,6 +368,8 @@ struct ServerDetailView: View {
     let profile: ServerProfile
     @StateObject private var monitor: ServerMonitor
     @State private var tab = 0
+    @State private var installMsg: String?
+    @State private var installing = false
 
     init(profile: ServerProfile) {
         self.profile = profile
@@ -271,17 +400,70 @@ struct ServerDetailView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .navigationBarTrailing) {
-                NavigationLink(
-                    destination: AIChatView(
-                        contextTitle: profile.name,
-                        contextText: monitor.aiContext,
-                        quickPrompts: ["分析这台服务器的状态", "流量和负载有没有异常？", "节点连不上怎么排查？"]
-                    )
-                ) {
-                    Image(systemName: "sparkles")
+                HStack(spacing: 12) {
+                    if profile.auth == .key || true {
+                        Menu {
+                            Button {
+                                Task { await installPublicKey() }
+                            } label: {
+                                Label("一键安装公钥到服务器", systemImage: "key.fill")
+                            }
+                            .disabled(installing)
+                        } label: {
+                            Image(systemName: "key")
+                        }
+                    }
+                    NavigationLink(
+                        destination: AIChatView(
+                            contextTitle: profile.name,
+                            contextText: monitor.aiContext,
+                            quickPrompts: ["分析这台服务器的状态", "流量和负载有没有异常？", "节点连不上怎么排查？"]
+                        )
+                    ) {
+                        Image(systemName: "sparkles")
+                    }
                 }
             }
         }
         .onAppear { monitor.start() }
+        .alert("公钥安装", isPresented: Binding(
+            get: { installMsg != nil },
+            set: { if !$0 { installMsg = nil } }
+        )) {
+            Button("好") { installMsg = nil }
+        } message: {
+            Text(installMsg ?? "")
+        }
+    }
+
+    /// 使用当前已建立的 SSH 会话，把本机密钥对应的公钥写入远端 authorized_keys
+    private func installPublicKey() async {
+        installing = true
+        defer { installing = false }
+        let secret = ServerStore.secret(for: profile)
+        guard let pub = KeyMaterial.publicKey(from: secret) else {
+            // 当前是密码登录：临时生成一把密钥，装上去，并切换该服务器为密钥登录
+            let key = Curve25519.Signing.PrivateKey()
+            let openssh = key.makeSSHRepresentation(comment: "sshdash")
+            let pub = sshPublicKeyString(key, comment: "sshdash")
+            do {
+                let out = try await monitor.runStreamCollect(RemoteShell.wrap(PubkeyInstall.script(publicKey: pub)))
+                // 装成功后，把密钥写入钥匙串并切换 auth（不改 profile 引用的话列表不会立刻变，这里只提示）
+                var updated = profile
+                updated.auth = .key
+                ServerStore.setSecret(openssh, for: updated)
+                // 通知用户：需要重新编辑保存一次以切换登录方式显示；或我们直接改 store
+                installMsg = out + "\n\n已生成新密钥并尝试写入。请到「编辑服务器」把登录方式改为「密钥」后保存（私钥已写入钥匙串）。\n公钥：\n" + pub
+            } catch {
+                installMsg = friendlyError(error)
+            }
+            return
+        }
+        do {
+            let out = try await monitor.runStreamCollect(RemoteShell.wrap(PubkeyInstall.script(publicKey: pub)))
+            installMsg = out
+        } catch {
+            installMsg = friendlyError(error)
+        }
     }
 }

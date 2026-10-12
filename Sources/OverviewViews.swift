@@ -9,6 +9,9 @@ struct OverviewTab: View {
             VStack(spacing: 14) {
                 statusCard
                 if monitor.updatedAt != nil {
+                    if !alerts(s).isEmpty {
+                        alertsCard(alerts(s))
+                    }
                     infoCard(s)
                     gaugesCard(s)
                     trafficCard(s)
@@ -18,6 +21,48 @@ struct OverviewTab: View {
             }
             .padding()
         }
+    }
+
+    // MARK: 告警
+
+    private func alerts(_ s: ServerStats) -> [String] {
+        var a: [String] = []
+        if s.cpuPercent >= 85 {
+            a.append("CPU 使用率 \(Int(s.cpuPercent))%，较高")
+        }
+        let memRatio = Double(s.memUsed) / Double(max(s.memTotal, 1))
+        if memRatio >= 0.9 {
+            a.append("内存使用 \(Int(memRatio * 100))%，接近上限")
+        }
+        let diskRatio = Double(s.diskUsed) / Double(max(s.diskTotal, 1))
+        if diskRatio >= 0.9 {
+            a.append("根分区磁盘 \(Int(diskRatio * 100))%，空间紧张")
+        }
+        if s.swapTotal > 0 {
+            let swapRatio = Double(s.swapUsed) / Double(s.swapTotal)
+            if swapRatio >= 0.5 {
+                a.append("Swap 使用 \(Int(swapRatio * 100))%，可能内存不足")
+            }
+        }
+        return a
+    }
+
+    private func alertsCard(_ items: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("资源告警", systemImage: "exclamationmark.triangle.fill")
+                .font(.headline)
+                .foregroundColor(.orange)
+            ForEach(items, id: \.self) { msg in
+                Text("· " + msg)
+                    .font(.subheadline)
+                    .foregroundColor(.orange)
+            }
+        }
+        .neonCard()
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(Color.orange.opacity(0.55), lineWidth: 1)
+        )
     }
 
     // MARK: 状态
@@ -93,19 +138,19 @@ struct OverviewTab: View {
                 title: "CPU",
                 value: s.cpuPercent / 100,
                 detail: "\(s.cpus) 核",
-                tint: Theme.cyan
+                tint: s.cpuPercent >= 85 ? .orange : Theme.cyan
             )
             RingGauge(
                 title: "内存",
                 value: Double(s.memUsed) / Double(max(s.memTotal, 1)),
                 detail: "\(fmtBytes(s.memUsed))/\(fmtBytes(s.memTotal))",
-                tint: Theme.purple
+                tint: Double(s.memUsed) / Double(max(s.memTotal, 1)) >= 0.9 ? .orange : Theme.purple
             )
             RingGauge(
                 title: "磁盘",
                 value: Double(s.diskUsed) / Double(max(s.diskTotal, 1)),
                 detail: "\(fmtBytes(s.diskUsed))/\(fmtBytes(s.diskTotal))",
-                tint: Theme.pink
+                tint: Double(s.diskUsed) / Double(max(s.diskTotal, 1)) >= 0.9 ? .orange : Theme.pink
             )
         }
         .neonCard()

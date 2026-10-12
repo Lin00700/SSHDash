@@ -6,6 +6,7 @@ struct ConsoleTab: View {
     @State private var output = ""
     @State private var running = false
     @State private var task: Task<Void, Never>?
+    @State private var history: [String] = UserDefaults.standard.stringArray(forKey: "ssh_cmd_history") ?? []
 
     private let quick: [(String, String)] = [
         ("系统", "cat /etc/os-release | head -n 3; uname -a; uptime"),
@@ -42,11 +43,44 @@ struct ConsoleTab: View {
                 .padding(.vertical, 6)
             }
 
+            if !history.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "clock.arrow.circlepath")
+                            .font(.caption)
+                            .foregroundColor(Theme.textDim)
+                        ForEach(history.prefix(12), id: \.self) { h in
+                            Button {
+                                command = h
+                                run()
+                            } label: {
+                                Text(h.count > 28 ? String(h.prefix(26)) + "…" : h)
+                                    .font(.caption2.monospaced())
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 5)
+                                    .background(Capsule().stroke(Theme.cyan.opacity(0.45)))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        Button {
+                            history = []
+                            UserDefaults.standard.removeObject(forKey: "ssh_cmd_history")
+                        } label: {
+                            Text("清空")
+                                .font(.caption2)
+                                .foregroundColor(.orange)
+                        }
+                    }
+                    .padding(.horizontal)
+                    .padding(.bottom, 4)
+                }
+            }
+
             ScrollViewReader { proxy in
                 ScrollView {
                     VStack(alignment: .leading, spacing: 8) {
                         if output.isEmpty {
-                            Text("在下面输入命令，或点上面的快捷命令。命令在服务器上以登录用户身份执行，不支持交互式程序（如 vim、top 不带参数）。")
+                            Text("在下面输入命令，或点上面的快捷命令。命令在服务器上以登录用户身份执行，不支持交互式程序（如 vim、top 不带参数）。最近执行过的命令会出现在历史栏，点一下即可重跑。")
                                 .font(.footnote)
                                 .foregroundColor(Theme.textDim)
                         } else {
@@ -104,6 +138,7 @@ struct ConsoleTab: View {
     private func run() {
         let cmd = command.trimmingCharacters(in: .whitespacesAndNewlines)
         if cmd.isEmpty || running { return }
+        pushHistory(cmd)
         output = "$ \(cmd)\n"
         running = true
         task = Task { @MainActor in
@@ -117,6 +152,14 @@ struct ConsoleTab: View {
             monitor.lastOutput = "$ \(cmd)\n" + String(output.suffix(3500))
             running = false
         }
+    }
+
+    private func pushHistory(_ cmd: String) {
+        var h = history.filter { $0 != cmd }
+        h.insert(cmd, at: 0)
+        if h.count > 30 { h = Array(h.prefix(30)) }
+        history = h
+        UserDefaults.standard.set(h, forKey: "ssh_cmd_history")
     }
 
     private func append(_ s: String) {

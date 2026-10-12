@@ -300,6 +300,15 @@ final class ServerMonitor: ObservableObject {
         }
     }
 
+    /// 收集完整输出
+    func runStreamCollect(_ command: String) async throws -> String {
+        var out = ""
+        try await runStream(command) { chunk in
+            out += chunk
+        }
+        return stripANSI(out)
+    }
+
     /// 给 AI 的上下文：当前状态 + 最近一次命令输出
     var aiContext: String {
         let s = stats
