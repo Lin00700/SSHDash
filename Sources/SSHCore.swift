@@ -2,7 +2,6 @@ import Foundation
 import Citadel
 import Crypto
 import NIOCore
-import CCryptoBoringSSL
 
 enum AppSSHError: LocalizedError {
     case notConnected
@@ -35,7 +34,6 @@ enum ParsedKey {
 }
 
 enum KeyMaterial {
-    /// 是否为「原始 PEM 文本」，界面上不应自动解析
     static func isRawPEM(_ secret: String) -> Bool {
         let s = secret.trimmingCharacters(in: .whitespacesAndNewlines)
         if s.contains("BEGIN RSA PRIVATE KEY") { return true }
@@ -43,9 +41,27 @@ enum KeyMaterial {
         return false
     }
 
+    /// 保存时调用：RSA PEM 只做结构校验，绝不创建 BoringSSL 对象（避免闪退）
     static func normalize(secret: String, passphrase: String?) throws -> (stored: String, publicKey: String) {
         let trimmed = secret.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw AppSSHError.badKey }
+
+        if trimmed.contains("BEGIN RSA PRIVATE KEY") {
+            if trimmed.contains("ENCRYPTED") || trimmed.contains("Proc-Type: 4,ENCRYPTED") {
+                throw AppSSHError.encryptedPEM
+            }
+            let comps = try RSAComponents.fromPKCS1PEM(trimmed)
+            let pub = sshRSAPublicKeyString(modulus: comps.n, exponent: comps.e, comment: "sshdash")
+            return (trimmed, pub)
+        }
+
+        if trimmed.contains("BEGIN PRIVATE KEY"), !trimmed.contains("OPENSSH") {
+            if trimmed.contains("ENCRYPTED") { throw AppSSHError.encryptedPEM }
+            let comps = try RSAComponents.fromPKCS8PEM(trimmed)
+            let pub = sshRSAPublicKeyString(modulus: comps.n, exponent: comps.e, comment: "sshdash")
+            return (trimmed, pub)
+        }
+
         let parsed = try parse(trimmed, passphrase: passphrase)
         switch parsed {
         case .ed25519(let key):
@@ -60,31 +76,33 @@ enum KeyMaterial {
         let trimmed = secret.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw AppSSHError.badKey }
 
-        // 1) AWS Lightsail / EC2：PKCS#1 RSA PEM
+        // RSA PEM → 转成 OpenSSH 再交给 Citadel 官方解析器
         if trimmed.contains("BEGIN RSA PRIVATE KEY") {
             if trimmed.contains("ENCRYPTED") || trimmed.contains("Proc-Type: 4,ENCRYPTED") {
                 throw AppSSHError.encryptedPEM
             }
-            return try parseRSAPkcs1PEM(trimmed)
+            let openssh = try RSAComponents.fromPKCS1PEM(trimmed).toOpenSSHPrivateKey(comment: "sshdash")
+            let rsa = try Insecure.RSA.PrivateKey(sshRsa: openssh)
+            let comps = try RSAComponents.fromPKCS1PEM(trimmed)
+            let pub = sshRSAPublicKeyString(modulus: comps.n, exponent: comps.e, comment: "sshdash")
+            return .rsa(rsa, publicKeyLine: pub)
         }
 
-        // 2) PKCS#8
         if trimmed.contains("BEGIN PRIVATE KEY"), !trimmed.contains("OPENSSH") {
-            if trimmed.contains("ENCRYPTED") {
-                throw AppSSHError.encryptedPEM
-            }
-            return try parseRSAPkcs8PEM(trimmed)
+            if trimmed.contains("ENCRYPTED") { throw AppSSHError.encryptedPEM }
+            let comps = try RSAComponents.fromPKCS8PEM(trimmed)
+            let openssh = comps.toOpenSSHPrivateKey(comment: "sshdash")
+            let rsa = try Insecure.RSA.PrivateKey(sshRsa: openssh)
+            let pub = sshRSAPublicKeyString(modulus: comps.n, exponent: comps.e, comment: "sshdash")
+            return .rsa(rsa, publicKeyLine: pub)
         }
 
-        // 3) OpenSSH 格式
         if trimmed.contains("BEGIN OPENSSH PRIVATE KEY") {
             let passData = passphrase.flatMap { $0.isEmpty ? nil : $0.data(using: .utf8) }
             do {
                 let key = try Curve25519.Signing.PrivateKey(sshEd25519: trimmed, decryptionKey: passData)
                 return .ed25519(key)
-            } catch {
-                // fall through to RSA
-            }
+            } catch { /* try RSA */ }
             do {
                 let rsa = try Insecure.RSA.PrivateKey(sshRsa: trimmed)
                 return .rsa(rsa, publicKeyLine: "ssh-rsa (openssh) sshdash")
@@ -98,7 +116,6 @@ enum KeyMaterial {
             }
         }
 
-        // 4) 旧版 base64 raw ed25519
         if let raw = Data(base64Encoded: trimmed),
            raw.count == 32,
            let key = try? Curve25519.Signing.PrivateKey(rawRepresentation: raw) {
@@ -108,10 +125,17 @@ enum KeyMaterial {
         throw AppSSHError.badKey
     }
 
-    /// 仅用于展示；原始 RSA PEM 返回 nil，避免在 UI 线程做重解析
     static func publicKey(from secret: String) -> String? {
-        if isRawPEM(secret) { return nil }
-        guard let parsed = try? parse(secret) else { return nil }
+        let s = secret.trimmingCharacters(in: .whitespacesAndNewlines)
+        if isRawPEM(s) {
+            // 纯 Swift 抽 n/e，不碰 BoringSSL
+            if let comps = try? RSAComponents.fromPKCS1PEM(s)
+                ?? (try? RSAComponents.fromPKCS8PEM(s)) {
+                return sshRSAPublicKeyString(modulus: comps.n, exponent: comps.e, comment: "sshdash")
+            }
+            return nil
+        }
+        guard let parsed = try? parse(s) else { return nil }
         switch parsed {
         case .ed25519(let k):
             return sshEd25519PublicKeyString(k, comment: "sshdash")
@@ -130,7 +154,129 @@ enum KeyMaterial {
     }
 }
 
-// MARK: - 安全 Data 访问
+// MARK: - RSA 组件（纯 Swift，无 BoringSSL）
+
+private struct RSAComponents {
+    var n: Data
+    var e: Data
+    var d: Data
+    var p: Data
+    var q: Data
+    var iqmp: Data
+
+    static func fromPKCS1PEM(_ pem: String) throws -> RSAComponents {
+        let der = try pemBody(pem, begin: "BEGIN RSA PRIVATE KEY", end: "END RSA PRIVATE KEY")
+        return try fromPKCS1DER(der)
+    }
+
+    static func fromPKCS8PEM(_ pem: String) throws -> RSAComponents {
+        let der = try pemBody(pem, begin: "BEGIN PRIVATE KEY", end: "END PRIVATE KEY")
+        var idx = 0
+        guard der.byte(at: idx) == 0x30 else { throw AppSSHError.badKey }
+        idx += 1
+        _ = try readASN1Length(der, &idx)
+        guard der.byte(at: idx) == 0x02 else { throw AppSSHError.badKey }
+        idx += 1
+        let vlen = try readASN1Length(der, &idx)
+        guard idx + vlen <= der.count else { throw AppSSHError.badKey }
+        idx += vlen
+        guard der.byte(at: idx) == 0x30 else { throw AppSSHError.badKey }
+        idx += 1
+        let alen = try readASN1Length(der, &idx)
+        guard idx + alen <= der.count else { throw AppSSHError.badKey }
+        idx += alen
+        guard der.byte(at: idx) == 0x04 else { throw AppSSHError.badKey }
+        idx += 1
+        let klen = try readASN1Length(der, &idx)
+        guard klen > 0, idx + klen <= der.count else { throw AppSSHError.badKey }
+        return try fromPKCS1DER(der.subdata(in: idx..<(idx + klen)))
+    }
+
+    static func fromPKCS1DER(_ der: Data) throws -> RSAComponents {
+        guard der.count > 32 else { throw AppSSHError.badKey }
+        var idx = 0
+        guard der.byte(at: idx) == 0x30 else { throw AppSSHError.badKey }
+        idx += 1
+        _ = try readASN1Length(der, &idx)
+
+        _ = try readASN1Integer(der, &idx) // version
+        let n = try readASN1Integer(der, &idx)
+        let e = try readASN1Integer(der, &idx)
+        let d = try readASN1Integer(der, &idx)
+        let p = try readASN1Integer(der, &idx)
+        let q = try readASN1Integer(der, &idx)
+        _ = try readASN1Integer(der, &idx) // exp1
+        _ = try readASN1Integer(der, &idx) // exp2
+        let iqmp = try readASN1Integer(der, &idx)
+
+        guard n.count >= 64, !e.isEmpty, d.count >= 64, !p.isEmpty, !q.isEmpty, !iqmp.isEmpty else {
+            throw AppSSHError.badKey
+        }
+        return RSAComponents(n: n, e: e, d: d, p: p, q: q, iqmp: iqmp)
+    }
+
+    /// 转成 OpenSSH 私钥文本，供 Citadel `sshRsa:` 使用
+    func toOpenSSHPrivateKey(comment: String) -> String {
+        var root = Data()
+
+        // magic
+        root.append(contentsOf: Array("openssh-key-v1".utf8))
+        root.append(0x00)
+
+        putSSHString(&root, Data("none".utf8)) // cipher
+        putSSHString(&root, Data("none".utf8)) // kdf
+        putSSHString(&root, Data())             // kdf options
+
+        // # keys = 1
+        putU32(&root, 1)
+
+        // public key blob
+        var pub = Data()
+        putSSHString(&pub, Data("ssh-rsa".utf8))
+        putMPInt(&pub, e)
+        putMPInt(&pub, n)
+        putSSHString(&root, pub)
+
+        // private key blob
+        var priv = Data()
+        let check = UInt32.random(in: 0...UInt32.max)
+        putU32(&priv, check)
+        putU32(&priv, check)
+        putSSHString(&priv, Data("ssh-rsa".utf8))
+        putMPInt(&priv, n)
+        putMPInt(&priv, e)
+        putMPInt(&priv, d)
+        putMPInt(&priv, iqmp)
+        putMPInt(&priv, p)
+        putMPInt(&priv, q)
+        putSSHString(&priv, Data(comment.utf8))
+
+        // pad to multiple of 8
+        let pad = (8 - (priv.count % 8)) % 8
+        if pad == 0 {
+            // OpenSSH still pads a full block when already aligned? cipher none blockSize=8
+            // 若已对齐，补 8 字节 1..8
+            for i in 1...8 { priv.append(UInt8(i)) }
+        } else {
+            for i in 1...pad { priv.append(UInt8(i)) }
+        }
+        putSSHString(&root, priv)
+
+        let b64 = root.base64EncodedString()
+        // 每 70 字符换行，兼容部分解析器
+        var wrapped = ""
+        var i = b64.startIndex
+        while i < b64.endIndex {
+            let j = b64.index(i, offsetBy: 70, limitedBy: b64.endIndex) ?? b64.endIndex
+            wrapped += b64[i..<j]
+            wrapped += "\n"
+            i = j
+        }
+        return "-----BEGIN OPENSSH PRIVATE KEY-----\n\(wrapped)-----END OPENSSH PRIVATE KEY-----\n"
+    }
+}
+
+// MARK: - SSH / ASN.1 helpers（纯 Swift）
 
 private extension Data {
     func byte(at i: Int) -> UInt8? {
@@ -139,7 +285,23 @@ private extension Data {
     }
 }
 
-// MARK: - RSA PKCS#1 / PKCS#8 PEM
+private func putU32(_ data: inout Data, _ v: UInt32) {
+    var be = v.bigEndian
+    data.append(Data(bytes: &be, count: 4))
+}
+
+private func putSSHString(_ data: inout Data, _ s: Data) {
+    putU32(&data, UInt32(s.count))
+    data.append(s)
+}
+
+private func putMPInt(_ data: inout Data, _ magnitude: Data) {
+    var body = magnitude
+    while body.count > 1, body[0] == 0x00 { body = body.dropFirst() }
+    if body.isEmpty { body = Data([0x00]) }
+    if body[0] & 0x80 != 0 { body = Data([0x00]) + body }
+    putSSHString(&data, body)
+}
 
 private func pemBody(_ pem: String, begin: String, end: String) throws -> Data {
     let lines = pem
@@ -168,71 +330,6 @@ private func pemBody(_ pem: String, begin: String, end: String) throws -> Data {
     return data
 }
 
-private func parseRSAPkcs1PEM(_ pem: String) throws -> ParsedKey {
-    let der = try pemBody(pem, begin: "BEGIN RSA PRIVATE KEY", end: "END RSA PRIVATE KEY")
-    return try rsaFromPKCS1DER(der)
-}
-
-private func parseRSAPkcs8PEM(_ pem: String) throws -> ParsedKey {
-    let der = try pemBody(pem, begin: "BEGIN PRIVATE KEY", end: "END PRIVATE KEY")
-    var idx = 0
-    guard der.byte(at: idx) == 0x30 else { throw AppSSHError.badKey }
-    idx += 1
-    _ = try readASN1Length(der, &idx)
-
-    guard der.byte(at: idx) == 0x02 else { throw AppSSHError.badKey }
-    idx += 1
-    let vlen = try readASN1Length(der, &idx)
-    guard idx + vlen <= der.count else { throw AppSSHError.badKey }
-    idx += vlen
-
-    guard der.byte(at: idx) == 0x30 else { throw AppSSHError.badKey }
-    idx += 1
-    let alen = try readASN1Length(der, &idx)
-    guard idx + alen <= der.count else { throw AppSSHError.badKey }
-    idx += alen
-
-    guard der.byte(at: idx) == 0x04 else { throw AppSSHError.badKey }
-    idx += 1
-    let klen = try readASN1Length(der, &idx)
-    guard klen > 0, idx + klen <= der.count else { throw AppSSHError.badKey }
-    let pkcs1 = der.subdata(in: idx..<(idx + klen))
-    return try rsaFromPKCS1DER(pkcs1)
-}
-
-private func rsaFromPKCS1DER(_ der: Data) throws -> ParsedKey {
-    guard der.count > 20 else { throw AppSSHError.badKey }
-    var idx = 0
-    guard der.byte(at: idx) == 0x30 else { throw AppSSHError.badKey }
-    idx += 1
-    _ = try readASN1Length(der, &idx)
-
-    _ = try readASN1Integer(der, &idx) // version
-    let n = try readASN1Integer(der, &idx)
-    let e = try readASN1Integer(der, &idx)
-    let d = try readASN1Integer(der, &idx)
-
-    guard n.count >= 64, !e.isEmpty, d.count >= 64 else { throw AppSSHError.badKey }
-
-    guard let nBN = bnFromData(n),
-          let eBN = bnFromData(e),
-          let dBN = bnFromData(d) else {
-        throw AppSSHError.badKey
-    }
-
-    let key = Insecure.RSA.PrivateKey(privateExponent: dBN, publicExponent: eBN, modulus: nBN)
-    let pub = sshRSAPublicKeyString(modulus: n, exponent: e, comment: "sshdash")
-    return .rsa(key, publicKeyLine: pub)
-}
-
-private func bnFromData(_ data: Data) -> UnsafeMutablePointer<BIGNUM>? {
-    guard !data.isEmpty else { return nil }
-    return data.withUnsafeBytes { raw -> UnsafeMutablePointer<BIGNUM>? in
-        guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return nil }
-        return CCryptoBoringSSL_BN_bin2bn(base, data.count, nil)
-    }
-}
-
 private func readASN1Length(_ data: Data, _ idx: inout Int) throws -> Int {
     guard let firstByte = data.byte(at: idx) else { throw AppSSHError.badKey }
     idx += 1
@@ -256,6 +353,7 @@ private func readASN1Integer(_ data: Data, _ idx: inout Int) throws -> Data {
     guard len > 0, idx + len <= data.count else { throw AppSSHError.badKey }
     var intData = data.subdata(in: idx..<(idx + len))
     idx += len
+    // 保留数值：去掉多余前导 0，但至少留 1 字节
     while intData.count > 1, intData.byte(at: 0) == 0x00 {
         intData = intData.dropFirst()
     }
@@ -267,13 +365,8 @@ private func readASN1Integer(_ data: Data, _ idx: inout Int) throws -> Data {
 func sshEd25519PublicKeyString(_ priv: Curve25519.Signing.PrivateKey, comment: String) -> String {
     let pub = priv.publicKey.rawRepresentation
     var blob = Data()
-    func put(_ d: Data) {
-        var len = UInt32(d.count).bigEndian
-        blob.append(Data(bytes: &len, count: 4))
-        blob.append(d)
-    }
-    put(Data("ssh-ed25519".utf8))
-    put(pub)
+    putSSHString(&blob, Data("ssh-ed25519".utf8))
+    putSSHString(&blob, pub)
     return "ssh-ed25519 \(blob.base64EncodedString()) \(comment)"
 }
 
@@ -283,21 +376,9 @@ func sshPublicKeyString(_ priv: Curve25519.Signing.PrivateKey, comment: String) 
 
 func sshRSAPublicKeyString(modulus: Data, exponent: Data, comment: String) -> String {
     var blob = Data()
-    func putSSHString(_ d: Data) {
-        var len = UInt32(d.count).bigEndian
-        blob.append(Data(bytes: &len, count: 4))
-        blob.append(d)
-    }
-    func putMPInt(_ d: Data) {
-        var body = d
-        if let first = body.first, first & 0x80 != 0 {
-            body = Data([0x00]) + body
-        }
-        putSSHString(body)
-    }
-    putSSHString(Data("ssh-rsa".utf8))
-    putMPInt(exponent)
-    putMPInt(modulus)
+    putSSHString(&blob, Data("ssh-rsa".utf8))
+    putMPInt(&blob, exponent)
+    putMPInt(&blob, modulus)
     return "ssh-rsa \(blob.base64EncodedString()) \(comment)"
 }
 
