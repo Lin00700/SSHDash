@@ -36,7 +36,7 @@ struct ServersView: View {
                             Label("还没有服务器", systemImage: "server.rack")
                                 .font(.headline)
                                 .foregroundStyle(Theme.gradient)
-                            Text("点右上角 + 添加。支持密码、本机生成密钥，或直接导入已有的 OpenSSH 私钥文件（id_ed25519）。")
+                            Text("点右上角 + 添加。支持密码、本机生成 ed25519，或导入 AWS Lightsail / EC2 的 .pem（RSA）和 OpenSSH 私钥。")
                                 .font(.footnote)
                                 .foregroundColor(Theme.textDim)
                         }
@@ -136,7 +136,15 @@ struct ServerEditorView: View {
         _password = State(initialValue: profile.auth == .password ? secret : "")
         _keySecret = State(initialValue: profile.auth == .key ? secret : "")
         if profile.auth == .key, !secret.isEmpty {
-            _keySourceHint = State(initialValue: secret.hasPrefix("-----") ? "已导入 OpenSSH 私钥" : "本机生成的密钥")
+            let hint: String
+            if secret.contains("BEGIN RSA PRIVATE KEY") {
+                hint = "已导入 RSA PEM 私钥"
+            } else if secret.hasPrefix("-----") {
+                hint = "已导入私钥文件"
+            } else {
+                hint = "本机生成的密钥"
+            }
+            _keySourceHint = State(initialValue: hint)
         }
     }
 
@@ -230,11 +238,11 @@ struct ServerEditorView: View {
             } label: {
                 Label(copied ? "已复制" : "复制公钥", systemImage: "doc.on.doc")
             }
-            Text("把这一行公钥追加到服务器的 ~/.ssh/authorized_keys。若当前会话已连接，可在详情页右上角「钥匙」菜单一键写入。")
+            Text("AWS 机器一般已自动装好对应公钥。若要装到别的服务器，可复制公钥或用详情页「钥匙」菜单写入。")
                 .font(.caption)
                 .foregroundColor(.secondary)
         } else if keySecret.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("-----") {
-            Text("已粘贴私钥内容，保存时会校验格式。若密钥有口令，请在下方填写。")
+            Text("已读入私钥内容，点保存时会校验。加密密钥请填写口令。")
                 .font(.caption)
                 .foregroundColor(.secondary)
         } else {
@@ -252,20 +260,20 @@ struct ServerEditorView: View {
         Button {
             showImporter = true
         } label: {
-            Label("从文件导入私钥", systemImage: "doc.badge.plus")
+            Label("从文件导入私钥（.pem / OpenSSH）", systemImage: "doc.badge.plus")
         }
 
         Button {
             if let clip = UIPasteboard.general.string, clip.contains("BEGIN") {
                 applyImportedKey(clip, source: "从剪贴板导入")
             } else {
-                importError = "剪贴板里没有 OpenSSH 私钥（需要包含 BEGIN OPENSSH PRIVATE KEY）"
+                importError = "剪贴板里没有私钥（需要包含 BEGIN … PRIVATE KEY）"
             }
         } label: {
             Label("从剪贴板粘贴私钥", systemImage: "doc.on.clipboard")
         }
 
-        Button(publicKeyText == nil && keySecret.isEmpty ? "生成密钥对" : "重新生成（旧公钥将失效）") {
+        Button(publicKeyText == nil && keySecret.isEmpty ? "生成 ed25519 密钥对" : "重新生成 ed25519（旧公钥将失效）") {
             let key = Curve25519.Signing.PrivateKey()
             keySecret = key.makeSSHRepresentation(comment: "sshdash")
             keyPassphrase = ""
@@ -274,9 +282,11 @@ struct ServerEditorView: View {
             copied = false
         }
 
-        if publicKeyText != nil, let openssh = try? KeyMaterial.privateKey(from: keySecret).makeSSHRepresentation(comment: "sshdash") {
+        if let pub = publicKeyText, pub.hasPrefix("ssh-ed25519"),
+           let parsed = try? KeyMaterial.parse(keySecret),
+           case .ed25519(let key) = parsed {
             Button {
-                UIPasteboard.general.string = openssh
+                UIPasteboard.general.string = key.makeSSHRepresentation(comment: "sshdash")
             } label: {
                 Label("复制完整私钥（OpenSSH 格式）", systemImage: "key")
             }
@@ -310,18 +320,31 @@ struct ServerEditorView: View {
     private func applyImportedKey(_ text: String, source: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.contains("BEGIN") && trimmed.contains("PRIVATE KEY") else {
-            importError = "不是私钥文件（需要 OpenSSH 格式的 PRIVATE KEY）"
+            importError = "不是私钥文件（需要 BEGIN RSA PRIVATE KEY 或 BEGIN OPENSSH PRIVATE KEY）"
             return
         }
-        if let normalized = try? KeyMaterial.normalize(secret: trimmed, passphrase: keyPassphrase.isEmpty ? nil : keyPassphrase) {
+        do {
+            let normalized = try KeyMaterial.normalize(
+                secret: trimmed,
+                passphrase: keyPassphrase.isEmpty ? nil : keyPassphrase
+            )
             keySecret = normalized.stored
-            keySourceHint = source + "（ed25519）"
+            let kind: String
+            if normalized.publicKey.hasPrefix("ssh-rsa") {
+                kind = "RSA"
+            } else if normalized.publicKey.hasPrefix("ssh-ed25519") {
+                kind = "ed25519"
+            } else {
+                kind = "密钥"
+            }
+            keySourceHint = source + "（\(kind)）"
             importError = nil
             copied = false
-        } else {
+        } catch {
+            // 先收下原文，保存时再报详细错误（例如需要口令）
             keySecret = trimmed
             keySourceHint = source + "（待校验）"
-            importError = nil
+            importError = friendlyError(error)
             copied = false
         }
     }
@@ -440,7 +463,6 @@ struct ServerDetailView: View {
         }
     }
 
-    /// 使用当前已建立的 SSH 会话，把公钥写入远端 authorized_keys
     private func installPublicKey() async {
         installing = true
         defer { installing = false }
@@ -456,7 +478,6 @@ struct ServerDetailView: View {
             return
         }
 
-        // 密码登录：生成新密钥 → 写入远端 → 切到密钥登录
         let key = Curve25519.Signing.PrivateKey()
         let openssh = key.makeSSHRepresentation(comment: "sshdash")
         let pub = sshPublicKeyString(key, comment: "sshdash")
