@@ -139,7 +139,7 @@ struct ServerEditorView: View {
             let hint: String
             if secret.contains("BEGIN RSA PRIVATE KEY") {
                 hint = "已导入 RSA PEM 私钥"
-            } else if secret.hasPrefix("-----") {
+            } else if secret.contains("BEGIN") {
                 hint = "已导入私钥文件"
             } else {
                 hint = "本机生成的密钥"
@@ -152,8 +152,11 @@ struct ServerEditorView: View {
         !store.servers.contains(where: { $0.id == p.id })
     }
 
+    /// 展示用公钥：解析失败时返回 nil，绝不抛错/崩
     private var publicKeyText: String? {
-        KeyMaterial.publicKey(from: keySecret)
+        let s = keySecret.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !s.isEmpty else { return nil }
+        return KeyMaterial.publicKey(from: s)
     }
 
     private var valid: Bool {
@@ -163,7 +166,8 @@ struct ServerEditorView: View {
         if p.auth == .password {
             authOK = true
         } else {
-            authOK = publicKeyText != nil || keySecret.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("-----")
+            let s = keySecret.trimmingCharacters(in: .whitespacesAndNewlines)
+            authOK = !s.isEmpty && (s.contains("BEGIN") || publicKeyText != nil)
         }
         return hostOK && userOK && authOK
     }
@@ -216,7 +220,10 @@ struct ServerEditorView: View {
             allowedContentTypes: [.data, .plainText, .text, UTType(filenameExtension: "pem") ?? .data],
             allowsMultipleSelection: false
         ) { result in
-            handleImport(result)
+            // 回调可能不在主线程
+            DispatchQueue.main.async {
+                handleImport(result)
+            }
         }
     }
 
@@ -238,11 +245,11 @@ struct ServerEditorView: View {
             } label: {
                 Label(copied ? "已复制" : "复制公钥", systemImage: "doc.on.doc")
             }
-            Text("AWS 机器一般已自动装好对应公钥。若要装到别的服务器，可复制公钥或用详情页「钥匙」菜单写入。")
+            Text("AWS / Lightsail 实例创建时通常已写入对应公钥，可直接用此私钥登录。")
                 .font(.caption)
                 .foregroundColor(.secondary)
-        } else if keySecret.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("-----") {
-            Text("已读入私钥内容，点保存时会校验。加密密钥请填写口令。")
+        } else if keySecret.trimmingCharacters(in: .whitespacesAndNewlines).contains("BEGIN") {
+            Text("已读入私钥文件，点「保存」时会校验格式。")
                 .font(.caption)
                 .foregroundColor(.secondary)
         } else {
@@ -273,7 +280,7 @@ struct ServerEditorView: View {
             Label("从剪贴板粘贴私钥", systemImage: "doc.on.clipboard")
         }
 
-        Button(publicKeyText == nil && keySecret.isEmpty ? "生成 ed25519 密钥对" : "重新生成 ed25519（旧公钥将失效）") {
+        Button(keySecret.isEmpty ? "生成 ed25519 密钥对" : "重新生成 ed25519（旧公钥将失效）") {
             let key = Curve25519.Signing.PrivateKey()
             keySecret = key.makeSSHRepresentation(comment: "sshdash")
             keyPassphrase = ""
@@ -306,47 +313,41 @@ struct ServerEditorView: View {
             defer { if accessed { url.stopAccessingSecurityScopedResource() } }
             do {
                 let data = try Data(contentsOf: url)
-                guard let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .ascii) else {
-                    importError = "无法读取文件内容"
+                // 兼容 UTF-8 / ASCII；去掉可能的 BOM
+                var text = String(data: data, encoding: .utf8)
+                    ?? String(data: data, encoding: .ascii)
+                    ?? String(data: data, encoding: .isoLatin1)
+                if text == nil {
+                    importError = "无法读取文件内容（编码不支持）"
                     return
                 }
-                applyImportedKey(text, source: "已从文件导入：\(url.lastPathComponent)")
+                if text!.hasPrefix("\u{FEFF}") {
+                    text = String(text!.dropFirst())
+                }
+                applyImportedKey(text!, source: "已从文件导入：\(url.lastPathComponent)")
             } catch {
                 importError = "读取文件失败：\(error.localizedDescription)"
             }
         }
     }
 
+    /// 选文件时只保存原文，不立刻做重解析，避免闪退
     private func applyImportedKey(_ text: String, source: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.contains("BEGIN") && trimmed.contains("PRIVATE KEY") else {
+        guard trimmed.contains("BEGIN"), trimmed.contains("PRIVATE KEY") else {
             importError = "不是私钥文件（需要 BEGIN RSA PRIVATE KEY 或 BEGIN OPENSSH PRIVATE KEY）"
             return
         }
-        do {
-            let normalized = try KeyMaterial.normalize(
-                secret: trimmed,
-                passphrase: keyPassphrase.isEmpty ? nil : keyPassphrase
-            )
-            keySecret = normalized.stored
-            let kind: String
-            if normalized.publicKey.hasPrefix("ssh-rsa") {
-                kind = "RSA"
-            } else if normalized.publicKey.hasPrefix("ssh-ed25519") {
-                kind = "ed25519"
-            } else {
-                kind = "密钥"
-            }
-            keySourceHint = source + "（\(kind)）"
-            importError = nil
-            copied = false
-        } catch {
-            // 先收下原文，保存时再报详细错误（例如需要口令）
-            keySecret = trimmed
-            keySourceHint = source + "（待校验）"
-            importError = friendlyError(error)
-            copied = false
+        keySecret = trimmed
+        if trimmed.contains("BEGIN RSA PRIVATE KEY") {
+            keySourceHint = source + "（RSA PEM）"
+        } else if trimmed.contains("OPENSSH") {
+            keySourceHint = source + "（OpenSSH）"
+        } else {
+            keySourceHint = source
         }
+        importError = nil
+        copied = false
     }
 
     private func save() {
