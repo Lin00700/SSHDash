@@ -230,7 +230,7 @@ struct ServerEditorView: View {
             } label: {
                 Label(copied ? "已复制" : "复制公钥", systemImage: "doc.on.doc")
             }
-            Text("把这一行公钥追加到服务器的 ~/.ssh/authorized_keys。若服务器还能用密码登录，保存后可在详情页一键写入。")
+            Text("把这一行公钥追加到服务器的 ~/.ssh/authorized_keys。若当前会话已连接，可在详情页右上角「钥匙」菜单一键写入。")
                 .font(.caption)
                 .foregroundColor(.secondary)
         } else if keySecret.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("-----") {
@@ -267,7 +267,6 @@ struct ServerEditorView: View {
 
         Button(publicKeyText == nil && keySecret.isEmpty ? "生成密钥对" : "重新生成（旧公钥将失效）") {
             let key = Curve25519.Signing.PrivateKey()
-            // 存成 OpenSSH 标准格式，方便导出到其他工具
             keySecret = key.makeSSHRepresentation(comment: "sshdash")
             keyPassphrase = ""
             keySourceHint = "本机新生成的 ed25519 密钥"
@@ -314,7 +313,6 @@ struct ServerEditorView: View {
             importError = "不是私钥文件（需要 OpenSSH 格式的 PRIVATE KEY）"
             return
         }
-        // 先尝试无口令解析；失败则先原样保存，保存时再带口令规范化
         if let normalized = try? KeyMaterial.normalize(secret: trimmed, passphrase: keyPassphrase.isEmpty ? nil : keyPassphrase) {
             keySecret = normalized.stored
             keySourceHint = source + "（ed25519）"
@@ -366,6 +364,7 @@ struct ServerEditorView: View {
 
 struct ServerDetailView: View {
     let profile: ServerProfile
+    @EnvironmentObject var store: ServerStore
     @StateObject private var monitor: ServerMonitor
     @State private var tab = 0
     @State private var installMsg: String?
@@ -401,15 +400,20 @@ struct ServerDetailView: View {
         .toolbar {
             ToolbarItem(placement: .navigationBarTrailing) {
                 HStack(spacing: 12) {
-                    if profile.auth == .key || true {
-                        Menu {
-                            Button {
-                                Task { await installPublicKey() }
-                            } label: {
-                                Label("一键安装公钥到服务器", systemImage: "key.fill")
-                            }
-                            .disabled(installing)
+                    Menu {
+                        Button {
+                            Task { await installPublicKey() }
                         } label: {
+                            Label(
+                                profile.auth == .key ? "把当前公钥写入服务器" : "生成密钥并写入服务器",
+                                systemImage: "key.fill"
+                            )
+                        }
+                        .disabled(installing || monitor.state != .connected)
+                    } label: {
+                        if installing {
+                            ProgressView()
+                        } else {
                             Image(systemName: "key")
                         }
                     }
@@ -436,32 +440,35 @@ struct ServerDetailView: View {
         }
     }
 
-    /// 使用当前已建立的 SSH 会话，把本机密钥对应的公钥写入远端 authorized_keys
+    /// 使用当前已建立的 SSH 会话，把公钥写入远端 authorized_keys
     private func installPublicKey() async {
         installing = true
         defer { installing = false }
+
         let secret = ServerStore.secret(for: profile)
-        guard let pub = KeyMaterial.publicKey(from: secret) else {
-            // 当前是密码登录：临时生成一把密钥，装上去，并切换该服务器为密钥登录
-            let key = Curve25519.Signing.PrivateKey()
-            let openssh = key.makeSSHRepresentation(comment: "sshdash")
-            let pub = sshPublicKeyString(key, comment: "sshdash")
+        if let pub = KeyMaterial.publicKey(from: secret) {
             do {
                 let out = try await monitor.runStreamCollect(RemoteShell.wrap(PubkeyInstall.script(publicKey: pub)))
-                // 装成功后，把密钥写入钥匙串并切换 auth（不改 profile 引用的话列表不会立刻变，这里只提示）
-                var updated = profile
-                updated.auth = .key
-                ServerStore.setSecret(openssh, for: updated)
-                // 通知用户：需要重新编辑保存一次以切换登录方式显示；或我们直接改 store
-                installMsg = out + "\n\n已生成新密钥并尝试写入。请到「编辑服务器」把登录方式改为「密钥」后保存（私钥已写入钥匙串）。\n公钥：\n" + pub
+                installMsg = out
             } catch {
                 installMsg = friendlyError(error)
             }
             return
         }
+
+        // 密码登录：生成新密钥 → 写入远端 → 切到密钥登录
+        let key = Curve25519.Signing.PrivateKey()
+        let openssh = key.makeSSHRepresentation(comment: "sshdash")
+        let pub = sshPublicKeyString(key, comment: "sshdash")
         do {
             let out = try await monitor.runStreamCollect(RemoteShell.wrap(PubkeyInstall.script(publicKey: pub)))
-            installMsg = out
+            var updated = profile
+            updated.auth = .key
+            ServerStore.setSecret(openssh, for: updated)
+            if let i = store.servers.firstIndex(where: { $0.id == updated.id }) {
+                store.servers[i] = updated
+            }
+            installMsg = out + "\n\n已生成本机密钥并写入服务器，登录方式已切换为「密钥」。\n下次可用密钥登录（无需再输密码）。\n公钥：\n" + pub
         } catch {
             installMsg = friendlyError(error)
         }
