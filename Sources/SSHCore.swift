@@ -26,8 +26,6 @@ final class WeakBox<T: AnyObject> {
     init(_ v: T) { value = v }
 }
 
-// MARK: - 密钥材料
-
 enum ParsedKey {
     case ed25519(Curve25519.Signing.PrivateKey)
     case rsa(Insecure.RSA.PrivateKey, publicKeyLine: String)
@@ -41,8 +39,8 @@ enum KeyMaterial {
         return false
     }
 
-    /// 保存时调用：RSA PEM 只做结构校验，绝不创建 BoringSSL 对象（避免闪退）
-    static func normalize(secret: String, passphrase: String?) throws -> (stored: String, publicKey: String) {
+    /// 保存专用：RSA PEM 只做字符串级检查，绝不解析 DER / 创建密钥对象
+    static func normalizeForSave(secret: String, passphrase: String?) throws -> String {
         let trimmed = secret.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw AppSSHError.badKey }
 
@@ -50,15 +48,31 @@ enum KeyMaterial {
             if trimmed.contains("ENCRYPTED") || trimmed.contains("Proc-Type: 4,ENCRYPTED") {
                 throw AppSSHError.encryptedPEM
             }
-            let comps = try RSAComponents.fromPKCS1PEM(trimmed)
-            let pub = sshRSAPublicKeyString(modulus: comps.n, exponent: comps.e, comment: "sshdash")
-            return (trimmed, pub)
+            guard trimmed.contains("END RSA PRIVATE KEY") else { throw AppSSHError.badKey }
+            return trimmed
         }
 
         if trimmed.contains("BEGIN PRIVATE KEY"), !trimmed.contains("OPENSSH") {
             if trimmed.contains("ENCRYPTED") { throw AppSSHError.encryptedPEM }
-            let comps = try RSAComponents.fromPKCS8PEM(trimmed)
-            let pub = sshRSAPublicKeyString(modulus: comps.n, exponent: comps.e, comment: "sshdash")
+            guard trimmed.contains("END PRIVATE KEY") else { throw AppSSHError.badKey }
+            return trimmed
+        }
+
+        // OpenSSH / ed25519：需要真正规范化
+        let pair = try normalize(secret: trimmed, passphrase: passphrase)
+        return pair.stored
+    }
+
+    static func normalize(secret: String, passphrase: String?) throws -> (stored: String, publicKey: String) {
+        let trimmed = secret.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { throw AppSSHError.badKey }
+
+        // RSA：同样不在这里碰 BoringSSL，只返回原文 + 可选公钥
+        if isRawPEM(trimmed) {
+            if trimmed.contains("ENCRYPTED") || trimmed.contains("Proc-Type: 4,ENCRYPTED") {
+                throw AppSSHError.encryptedPEM
+            }
+            let pub = publicKeyFromRSAPemSafe(trimmed) ?? ""
             return (trimmed, pub)
         }
 
@@ -80,7 +94,9 @@ enum KeyMaterial {
             if trimmed.contains("ENCRYPTED") || trimmed.contains("Proc-Type: 4,ENCRYPTED") {
                 throw AppSSHError.encryptedPEM
             }
-            let comps = try RSAComponents.fromPKCS1PEM(trimmed)
+            guard let comps = try? RSAComponents.fromPKCS1PEM(trimmed) else {
+                throw AppSSHError.badKey
+            }
             let openssh = comps.toOpenSSHPrivateKey(comment: "sshdash")
             let rsa = try Insecure.RSA.PrivateKey(sshRsa: openssh)
             let pub = sshRSAPublicKeyString(modulus: comps.n, exponent: comps.e, comment: "sshdash")
@@ -89,7 +105,9 @@ enum KeyMaterial {
 
         if trimmed.contains("BEGIN PRIVATE KEY"), !trimmed.contains("OPENSSH") {
             if trimmed.contains("ENCRYPTED") { throw AppSSHError.encryptedPEM }
-            let comps = try RSAComponents.fromPKCS8PEM(trimmed)
+            guard let comps = try? RSAComponents.fromPKCS8PEM(trimmed) else {
+                throw AppSSHError.badKey
+            }
             let openssh = comps.toOpenSSHPrivateKey(comment: "sshdash")
             let rsa = try Insecure.RSA.PrivateKey(sshRsa: openssh)
             let pub = sshRSAPublicKeyString(modulus: comps.n, exponent: comps.e, comment: "sshdash")
@@ -127,11 +145,7 @@ enum KeyMaterial {
     static func publicKey(from secret: String) -> String? {
         let s = secret.trimmingCharacters(in: .whitespacesAndNewlines)
         if isRawPEM(s) {
-            let comps = (try? RSAComponents.fromPKCS1PEM(s)) ?? (try? RSAComponents.fromPKCS8PEM(s))
-            if let comps = comps {
-                return sshRSAPublicKeyString(modulus: comps.n, exponent: comps.e, comment: "sshdash")
-            }
-            return nil
+            return publicKeyFromRSAPemSafe(s)
         }
         guard let parsed = try? parse(s) else { return nil }
         switch parsed {
@@ -152,7 +166,18 @@ enum KeyMaterial {
     }
 }
 
-// MARK: - RSA 组件（纯 Swift，无 BoringSSL）
+/// 抽公钥：失败返回 nil，绝不抛到调用方以外
+private func publicKeyFromRSAPemSafe(_ pem: String) -> String? {
+    if let comps = try? RSAComponents.fromPKCS1PEM(pem) {
+        return sshRSAPublicKeyString(modulus: comps.n, exponent: comps.e, comment: "sshdash")
+    }
+    if let comps = try? RSAComponents.fromPKCS8PEM(pem) {
+        return sshRSAPublicKeyString(modulus: comps.n, exponent: comps.e, comment: "sshdash")
+    }
+    return nil
+}
+
+// MARK: - RSA 组件
 
 private struct RSAComponents {
     var n: Data
@@ -170,20 +195,20 @@ private struct RSAComponents {
     static func fromPKCS8PEM(_ pem: String) throws -> RSAComponents {
         let der = try pemBody(pem, begin: "BEGIN PRIVATE KEY", end: "END PRIVATE KEY")
         var idx = 0
-        guard der.byte(at: idx) == 0x30 else { throw AppSSHError.badKey }
+        guard der.safeByte(at: idx) == 0x30 else { throw AppSSHError.badKey }
         idx += 1
         _ = try readASN1Length(der, &idx)
-        guard der.byte(at: idx) == 0x02 else { throw AppSSHError.badKey }
+        guard der.safeByte(at: idx) == 0x02 else { throw AppSSHError.badKey }
         idx += 1
         let vlen = try readASN1Length(der, &idx)
         guard idx + vlen <= der.count else { throw AppSSHError.badKey }
         idx += vlen
-        guard der.byte(at: idx) == 0x30 else { throw AppSSHError.badKey }
+        guard der.safeByte(at: idx) == 0x30 else { throw AppSSHError.badKey }
         idx += 1
         let alen = try readASN1Length(der, &idx)
         guard idx + alen <= der.count else { throw AppSSHError.badKey }
         idx += alen
-        guard der.byte(at: idx) == 0x04 else { throw AppSSHError.badKey }
+        guard der.safeByte(at: idx) == 0x04 else { throw AppSSHError.badKey }
         idx += 1
         let klen = try readASN1Length(der, &idx)
         guard klen > 0, idx + klen <= der.count else { throw AppSSHError.badKey }
@@ -193,7 +218,7 @@ private struct RSAComponents {
     static func fromPKCS1DER(_ der: Data) throws -> RSAComponents {
         guard der.count > 32 else { throw AppSSHError.badKey }
         var idx = 0
-        guard der.byte(at: idx) == 0x30 else { throw AppSSHError.badKey }
+        guard der.safeByte(at: idx) == 0x30 else { throw AppSSHError.badKey }
         idx += 1
         _ = try readASN1Length(der, &idx)
 
@@ -261,7 +286,7 @@ private struct RSAComponents {
 }
 
 private extension Data {
-    func byte(at i: Int) -> UInt8? {
+    func safeByte(at i: Int) -> UInt8? {
         guard i >= 0, i < count else { return nil }
         return self[i]
     }
@@ -269,7 +294,7 @@ private extension Data {
 
 private func putU32(_ data: inout Data, _ v: UInt32) {
     var be = v.bigEndian
-    data.append(Data(bytes: &be, count: 4))
+    withUnsafeBytes(of: &be) { data.append(contentsOf: $0) }
 }
 
 private func putSSHString(_ data: inout Data, _ s: Data) {
@@ -279,9 +304,13 @@ private func putSSHString(_ data: inout Data, _ s: Data) {
 
 private func putMPInt(_ data: inout Data, _ magnitude: Data) {
     var body = magnitude
-    while body.count > 1, body[0] == 0x00 { body = body.dropFirst() }
+    while body.count > 1, let first = body.safeByte(at: 0), first == 0x00 {
+        body = Data(body.dropFirst())
+    }
     if body.isEmpty { body = Data([0x00]) }
-    if body[0] & 0x80 != 0 { body = Data([0x00]) + body }
+    if let first = body.safeByte(at: 0), first & 0x80 != 0 {
+        body = Data([0x00]) + body
+    }
     putSSHString(&data, body)
 }
 
@@ -313,7 +342,7 @@ private func pemBody(_ pem: String, begin: String, end: String) throws -> Data {
 }
 
 private func readASN1Length(_ data: Data, _ idx: inout Int) throws -> Int {
-    guard let firstByte = data.byte(at: idx) else { throw AppSSHError.badKey }
+    guard let firstByte = data.safeByte(at: idx) else { throw AppSSHError.badKey }
     idx += 1
     let first = Int(firstByte)
     if first & 0x80 == 0 { return first }
@@ -321,7 +350,7 @@ private func readASN1Length(_ data: Data, _ idx: inout Int) throws -> Int {
     guard nbytes > 0, nbytes <= 4, idx + nbytes <= data.count else { throw AppSSHError.badKey }
     var len = 0
     for _ in 0..<nbytes {
-        guard let b = data.byte(at: idx) else { throw AppSSHError.badKey }
+        guard let b = data.safeByte(at: idx) else { throw AppSSHError.badKey }
         len = (len << 8) | Int(b)
         idx += 1
     }
@@ -329,16 +358,16 @@ private func readASN1Length(_ data: Data, _ idx: inout Int) throws -> Int {
 }
 
 private func readASN1Integer(_ data: Data, _ idx: inout Int) throws -> Data {
-    guard data.byte(at: idx) == 0x02 else { throw AppSSHError.badKey }
+    guard data.safeByte(at: idx) == 0x02 else { throw AppSSHError.badKey }
     idx += 1
     let len = try readASN1Length(data, &idx)
     guard len > 0, idx + len <= data.count else { throw AppSSHError.badKey }
     var intData = data.subdata(in: idx..<(idx + len))
     idx += len
-    while intData.count > 1, intData.byte(at: 0) == 0x00 {
-        intData = intData.dropFirst()
+    while intData.count > 1, intData.safeByte(at: 0) == 0x00 {
+        intData = Data(intData.dropFirst())
     }
-    return Data(intData)
+    return intData
 }
 
 func sshEd25519PublicKeyString(_ priv: Curve25519.Signing.PrivateKey, comment: String) -> String {

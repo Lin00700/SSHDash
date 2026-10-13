@@ -21,8 +21,6 @@ struct ContentView: View {
     }
 }
 
-// MARK: - 服务器列表
-
 struct ServersView: View {
     @EnvironmentObject var store: ServerStore
     @State private var editing: ServerProfile?
@@ -102,8 +100,6 @@ struct ServerCard: View {
     }
 }
 
-// MARK: - 添加 / 编辑服务器
-
 struct ServerEditorView: View {
     @EnvironmentObject var store: ServerStore
     @Environment(\.presentationMode) private var mode
@@ -138,10 +134,10 @@ struct ServerEditorView: View {
         !store.servers.contains(where: { $0.id == p.id })
     }
 
-    /// 绝不在界面刷新时解析 RSA PEM（会闪退）
     private var publicKeyText: String? {
         let s = keySecret.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !s.isEmpty else { return nil }
+        // RSA PEM：界面绝不解析
         if KeyMaterial.isRawPEM(s) { return nil }
         return KeyMaterial.publicKey(from: s)
     }
@@ -229,11 +225,11 @@ struct ServerEditorView: View {
                 Label(copied ? "已复制" : "复制公钥", systemImage: "doc.on.doc")
             }
         } else if KeyMaterial.isRawPEM(keySecret) {
-            Text("已读入 RSA 私钥文件。Lightsail 用户名一般为 ubuntu 或 bitnami。点「保存」时会校验。")
+            Text("已读入 RSA 私钥。Lightsail 用户名一般为 ubuntu / bitnami。点保存即可。")
                 .font(.caption)
                 .foregroundColor(.secondary)
         } else if keySecret.contains("BEGIN") {
-            Text("已读入私钥，点「保存」时会校验格式。")
+            Text("已读入私钥，点保存即可。")
                 .font(.caption)
                 .foregroundColor(.secondary)
         } else {
@@ -286,7 +282,7 @@ struct ServerEditorView: View {
                     ?? String(data: data, encoding: .ascii)
                     ?? String(data: data, encoding: .isoLatin1)
                 guard var t = text else {
-                    importError = "无法读取文件内容（编码不支持）"
+                    importError = "无法读取文件内容"
                     return
                 }
                 if t.hasPrefix("\u{FEFF}") { t = String(t.dropFirst()) }
@@ -297,7 +293,6 @@ struct ServerEditorView: View {
         }
     }
 
-    /// 只存原文，绝不在这里解析（解析会闪退）
     private func applyImportedKey(_ text: String, source: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.contains("BEGIN"), trimmed.contains("PRIVATE KEY") else {
@@ -306,7 +301,7 @@ struct ServerEditorView: View {
         }
         keySecret = trimmed
         if trimmed.contains("BEGIN RSA PRIVATE KEY") {
-            keySourceHint = source + "（RSA PEM，保存时校验）"
+            keySourceHint = source + "（RSA PEM）"
         } else if trimmed.contains("OPENSSH") {
             keySourceHint = source + "（OpenSSH）"
         } else {
@@ -327,17 +322,32 @@ struct ServerEditorView: View {
         if np.auth == .password {
             ServerStore.setSecret(password, for: np)
         } else {
-            do {
-                let normalized = try KeyMaterial.normalize(
-                    secret: keySecret,
-                    passphrase: keyPassphrase.isEmpty ? nil : keyPassphrase
-                )
-                ServerStore.setSecret(normalized.stored, for: np)
-                keySecret = normalized.stored
+            // RSA PEM：零解析直接存，避免任何闪退
+            let raw = keySecret.trimmingCharacters(in: .whitespacesAndNewlines)
+            if KeyMaterial.isRawPEM(raw) {
+                if raw.contains("ENCRYPTED") || raw.contains("Proc-Type: 4,ENCRYPTED") {
+                    importError = AppSSHError.encryptedPEM.errorDescription
+                    return
+                }
+                guard raw.contains("END") else {
+                    importError = "私钥文件不完整"
+                    return
+                }
+                ServerStore.setSecret(raw, for: np)
                 importError = nil
-            } catch {
-                importError = friendlyError(error)
-                return
+            } else {
+                do {
+                    let stored = try KeyMaterial.normalizeForSave(
+                        secret: keySecret,
+                        passphrase: keyPassphrase.isEmpty ? nil : keyPassphrase
+                    )
+                    ServerStore.setSecret(stored, for: np)
+                    keySecret = stored
+                    importError = nil
+                } catch {
+                    importError = friendlyError(error)
+                    return
+                }
             }
         }
 
@@ -349,8 +359,6 @@ struct ServerEditorView: View {
         mode.wrappedValue.dismiss()
     }
 }
-
-// MARK: - 服务器详情
 
 struct ServerDetailView: View {
     let profile: ServerProfile
@@ -431,18 +439,7 @@ struct ServerDetailView: View {
         defer { installing = false }
 
         let secret = ServerStore.secret(for: profile)
-        if let pub = KeyMaterial.publicKey(from: secret) {
-            do {
-                let out = try await monitor.runStreamCollect(RemoteShell.wrap(PubkeyInstall.script(publicKey: pub)))
-                installMsg = out
-            } catch {
-                installMsg = friendlyError(error)
-            }
-            return
-        }
-
-        // RSA PEM 已存钥匙串：尝试解析出公钥再写入
-        if let pub = (try? KeyMaterial.normalize(secret: secret, passphrase: nil))?.publicKey {
+        if let pub = KeyMaterial.publicKey(from: secret), !pub.isEmpty {
             do {
                 let out = try await monitor.runStreamCollect(RemoteShell.wrap(PubkeyInstall.script(publicKey: pub)))
                 installMsg = out
@@ -463,7 +460,7 @@ struct ServerDetailView: View {
             if let i = store.servers.firstIndex(where: { $0.id == updated.id }) {
                 store.servers[i] = updated
             }
-            installMsg = out + "\n\n已生成本机密钥并写入服务器，登录方式已切换为「密钥」。\n公钥：\n" + pub
+            installMsg = out + "\n\n已生成本机密钥并写入服务器。\n公钥：\n" + pub
         } catch {
             installMsg = friendlyError(error)
         }
